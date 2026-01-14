@@ -6,17 +6,24 @@
 // recommended to use for allocations of size > 128
 // TODO: buddy allocator for sizes <= 128
 
+#define ALLOCATOR_SIZE    (32 << 20)
+#define BEST_FIT_CAPACITY 8
+
 void *alloc_base = NULL;
 void *alloc_end = NULL;
 void *alloc_cursor = NULL;
 void *alloc_last_allocation = NULL;
 void *alloc_last_free = NULL;
-#define alloc_meta_sizeof    (sizeof(void *) * 2 + sizeof(uint32_t) + sizeof(char))
+#if 1    // align data by 8 bytes
+#define alloc_meta_sizeof ((sizeof(void *) * 2 + sizeof(uint32_t) + sizeof(char)) / 8 + 1) * 8
+#else
+#define alloc_meta_sizeof (sizeof(void *) * 2 + sizeof(uint32_t) + sizeof(char))
+#endif
 #define alloc_meta_prev(ptr) (void **)(ptr)
 #define alloc_meta_next(ptr) (void **)((ptr) + sizeof(void *))
 #define alloc_meta_size(ptr) (uint32_t *)((ptr) + sizeof(void *) * 2)
 #define alloc_meta_tag(ptr)  (char *)((ptr) + sizeof(void *) * 2 + sizeof(uint32_t))
-#define alloc_meta_data(ptr) (void *)((ptr) + sizeof(void *) * 2 + sizeof(uint32_t) + sizeof(char))
+#define alloc_meta_data(ptr) (void *)((ptr) + alloc_meta_sizeof)
 
 enum {
 	ALLOCATION_INVALID = 0,
@@ -24,10 +31,11 @@ enum {
 	ALLOCATION_USED = 2,
 };
 
+#define dump_ptr(ptr) (ptr ? (void *)((ptr) - alloc_base + ALLOCATOR_SIZE) : NULL)
+
 void
 allocation_dump(void *ptr)
 {
-	ptr -= alloc_meta_sizeof;
 	void *prev = *alloc_meta_prev(ptr);
 	void *next = *alloc_meta_next(ptr);
 	const char *tag;
@@ -43,15 +51,31 @@ allocation_dump(void *ptr)
 		tag = "<invalid>";
 		break;
 	}
-	printf("%p: Allocation{prev: %p, next: %p, size: %d, tag: %s}\n", ptr, prev, next, *alloc_meta_size(ptr), tag);
+	printf("%p: Allocation{prev: %p, next: %p, size: %d, tag: %s}\n", dump_ptr(ptr), dump_ptr(prev), dump_ptr(next),
+	       *alloc_meta_size(ptr), tag);
 }
+
+void
+memory_dump()
+{
+	void *cursor = alloc_base;
+	printf("\nlast: {alloc: %p, free: %p}, cursor: %p\n", dump_ptr(alloc_last_allocation), dump_ptr(alloc_last_free),
+	       dump_ptr(alloc_cursor));
+	while (cursor < alloc_end && *alloc_meta_size(cursor) > 0) {
+		allocation_dump(cursor);
+		cursor += alloc_meta_sizeof + *alloc_meta_size(cursor);
+	}
+}
+
+#undef dump_ptr
 
 void
 alloc_init(void)
 {
-	alloc_base = malloc(32 << 20);    // 32MB
+	alloc_base = malloc(ALLOCATOR_SIZE);    // 32MB
 	alloc_cursor = alloc_base;
-	alloc_end = alloc_base + (32 << 20);
+	alloc_end = alloc_base + ALLOCATOR_SIZE;
+	printf("base: %p; end: %p; header_size: %d\n", alloc_base, alloc_end, (int)alloc_meta_sizeof);
 }
 
 char
@@ -61,36 +85,40 @@ allocation_check_next(void *ptr)
 }
 
 void
-allocation_pop(void *ptr)
+allocation_unlink(void *ptr)
 {
 	void *next = *alloc_meta_next(ptr);
 	void *prev = *alloc_meta_prev(ptr);
 	if (next)
 		*alloc_meta_prev(next) = prev;
+	*alloc_meta_next(ptr) = NULL;
 	if (prev)
 		*alloc_meta_next(prev) = next;
+	*alloc_meta_prev(ptr) = NULL;
 }
 
 // links b instead of a, a retains links, flush manually
 void
-allocation_switch(void *a, void *b)
+allocation_replace(void *a, void *b)
 {
 	void *next = *alloc_meta_next(a);
 	void *prev = *alloc_meta_prev(a);
-	if (next) {
+	printf("%p <> %p\n", prev, next);
+	if (next)
 		*alloc_meta_prev(next) = b;
-		*alloc_meta_next(b) = next;
-	}
-	if (prev) {
+	*alloc_meta_next(b) = next;
+	if (prev)
 		*alloc_meta_next(prev) = b;
-		*alloc_meta_prev(b) = prev;
-	}
+	*alloc_meta_prev(b) = prev;
 }
 
 void *
 alloc_reserve(size_t size)
 {
 	void *cursor;
+	void *best_fit[BEST_FIT_CAPACITY] = { 0 };
+	size_t cur_size, best_size;
+	char best_count = 0;
 
 	if (!alloc_last_free) {
 		*alloc_meta_size(alloc_cursor) = size;
@@ -100,16 +128,60 @@ alloc_reserve(size_t size)
 	}
 
 	cursor = alloc_last_free;
+	cur_size = *alloc_meta_size(cursor);
 
-	if (*alloc_meta_size(cursor) >= size) {
+	if (cur_size == size) {
 		alloc_last_free = *alloc_meta_next(cursor);
-		allocation_pop(cursor);
-		return cursor;
+		goto end;
+	} else if (cur_size > size) {
+		best_fit[best_count++] = cursor;
+		best_size = cur_size;
 	}
 
-	while (cursor && *alloc_meta_size(cursor) < size) {
+	while (cursor) {
+		cur_size = *alloc_meta_size(cursor);
 		// add merging code here, this may introduce overhead
+		if (cur_size < size) {
+			void *next = cursor + alloc_meta_sizeof + cur_size;
+			while (*alloc_meta_tag(next) == ALLOCATION_UNUSED) {
+				if (best_count) {
+					int remove_at = -1;
+					for (int i = 0; i < best_count; i++) {
+						if (remove_at >= 0) {
+							best_fit[remove_at - (i - remove_at)] = best_fit[i];
+							continue;
+						}
+						if (next == best_fit[i]) {
+							remove_at = i;
+						}
+					}
+					if (remove_at >= 0) {
+						best_count -= 1;
+						best_size = *alloc_meta_size(best_fit[best_count - 1]);
+					}
+				}
+				cur_size += *alloc_meta_size(next) + alloc_meta_sizeof;
+				allocation_unlink(next);
+				next = cursor + alloc_meta_sizeof + cur_size;
+			}
+			*alloc_meta_size(cursor) = cur_size;
+		}
+		if (cur_size == size)
+			goto end;
+		if (cur_size > size && (best_count == 0 || cur_size < best_size)) {
+			best_fit[best_count++] = cursor;
+			best_size = cur_size;
+			if (best_count == BEST_FIT_CAPACITY)
+				break;
+		}
 		cursor = *alloc_meta_next(cursor);
+	}
+
+	if (best_count) {
+		if (best_count == 1)
+			alloc_last_free = *alloc_meta_next(alloc_last_free);
+		cursor = best_fit[best_count - 1];
+		cur_size = best_size;
 	}
 
 	if (!cursor) {
@@ -118,13 +190,24 @@ alloc_reserve(size_t size)
 		*alloc_meta_size(alloc_cursor) = size;
 		cursor = alloc_cursor;
 		alloc_cursor += alloc_meta_sizeof + size;
-	} else if (*alloc_meta_size(cursor) - size > alloc_meta_sizeof * 3) {
-		void *next = alloc_meta_data(cursor) + *alloc_meta_size(cursor) - size - alloc_meta_sizeof;
+	} else if (cur_size - size > alloc_meta_sizeof * 3) {
+#if 1    // cut and reserve end
+		void *next = alloc_meta_data(cursor) + cur_size - size - alloc_meta_sizeof;
 		*alloc_meta_size(cursor) -= alloc_meta_sizeof + size;
 		*alloc_meta_size(next) = size;
 		return next;
+#else    // cut and reserve head
+		void *next = alloc_meta_data(cursor) + size;
+		*alloc_meta_size(cursor) = size;
+		*alloc_meta_size(next) = cur_size - alloc_meta_sizeof - size;
+		*alloc_meta_tag(next) = ALLOCATION_UNUSED;
+		allocation_replace(cursor, next);
+		return cursor;
+#endif
 	}
 
+end:;
+	allocation_unlink(cursor);
 	return cursor;
 }
 
@@ -133,24 +216,22 @@ void *
 alloc(size_t size)
 {
 	void *allocation = alloc_reserve(size);    // alloc_cursor;
-	// 0
-	// - void *prev - NULL is none
-	// sizeof(void*)
-	// - void *next - NULL is none
-	// sizeof(void*) * 2
-	// - uint32_t size
-	// sizeof(void*) * 2 + sizeof(uint32_t)
-	// - char tag
-
-	if (alloc_last_allocation) {
-		*alloc_meta_prev(allocation) = alloc_last_allocation;
-		*alloc_meta_next(alloc_last_allocation) = allocation;
-	}
+	if (allocation == NULL)
+		return NULL;
 
 	*alloc_meta_tag(allocation) = ALLOCATION_USED;
 
+	if (allocation == alloc_last_free) {
+		printf("\n");
+		allocation_dump(allocation);
+	}
+
+	if (alloc_last_allocation)
+		*alloc_meta_next(alloc_last_allocation) = allocation;
+	*alloc_meta_prev(allocation) = alloc_last_allocation;
 	alloc_last_allocation = allocation;
-	alloc_cursor = allocation + alloc_meta_sizeof + size;
+
+	memory_dump();
 	return alloc_meta_data(allocation);
 }
 
@@ -163,9 +244,9 @@ fre(void *ptr)
 	*alloc_meta_tag(ptr) = ALLOCATION_UNUSED;
 
 	// unlink from allocated
-	allocation_pop(ptr);
-	*alloc_meta_next(ptr) = NULL;
-	*alloc_meta_prev(ptr) = NULL;
+	if (ptr == alloc_last_allocation)
+		alloc_last_allocation = *alloc_meta_next(alloc_last_allocation);
+	allocation_unlink(ptr);
 
 	// put as last free
 	*alloc_meta_next(ptr) = alloc_last_free;
@@ -173,15 +254,17 @@ fre(void *ptr)
 		*alloc_meta_prev(alloc_last_free) = ptr;
 	alloc_last_free = ptr;
 
-	// merge unused memory in sequence (forward)
-	next = ptr + alloc_meta_sizeof + *alloc_meta_size(ptr);
+	// merge unused memory (forward step)
+	size_t new_size = *alloc_meta_size(ptr);
+	next = ptr + alloc_meta_sizeof + new_size;
 	while (*alloc_meta_tag(next) == ALLOCATION_UNUSED) {
-		*alloc_meta_size(ptr) += *alloc_meta_size(next) + alloc_meta_sizeof;
-		allocation_pop(next);
-		*alloc_meta_next(next) = NULL;
-		*alloc_meta_prev(next) = NULL;
-		next = ptr + alloc_meta_sizeof + *alloc_meta_size(ptr);
+		new_size += *alloc_meta_size(next) + alloc_meta_sizeof;
+		allocation_unlink(next);
+		next = ptr + alloc_meta_sizeof + new_size;
 	}
+	*alloc_meta_size(ptr) = new_size;
+
+	memory_dump();
 }
 
 int
@@ -189,36 +272,14 @@ main(int argc, char **argv)
 {
 	alloc_init();
 
-	printf("base: %p; end: %p;\n", alloc_base, alloc_end);
-	void *foo = alloc(10), *bar = alloc(43), *baz = alloc(57), *qux = alloc(162);
+	void *m[] = {
+		alloc(10), alloc(100), alloc(110), alloc(120), alloc(210), alloc(10101),
+	};
 
-	printf("\n");
-	fre(baz);
-	allocation_dump(foo);
-	allocation_dump(bar);
-	allocation_dump(baz);
-	allocation_dump(qux);
-
-	printf("\n");
-	fre(qux);
-	allocation_dump(foo);
-	allocation_dump(bar);
-	allocation_dump(baz);
-	allocation_dump(qux);
-
-	printf("\n");
-	fre(foo);
-	allocation_dump(foo);
-	allocation_dump(bar);
-	allocation_dump(baz);
-	allocation_dump(qux);
-
-	printf("\n");
-	fre(bar);
-	allocation_dump(foo);
-	allocation_dump(bar);
-	allocation_dump(baz);
-	allocation_dump(qux);
+	fre(m[1]);
+	fre(m[3]);
+	m[1] = alloc(110);
+	m[3] = alloc(20);
 
 	free(alloc_base);
 	return 0;
