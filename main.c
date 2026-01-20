@@ -1,10 +1,14 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdbool.h>
+#include <assert.h>
 
 // this allocator has overhead of 21 bytes per allocation
 // recommended to use for allocations of size > 128
-// TODO: buddy allocator for sizes <= 128
+// TODO: slab allocators for sizes <= 128
 
 #define ALLOCATOR_SIZE    (32 << 20)
 #define BEST_FIT_CAPACITY 8
@@ -14,21 +18,36 @@ void *alloc_end = NULL;
 void *alloc_cursor = NULL;
 void *alloc_last_allocation = NULL;
 void *alloc_last_free = NULL;
-#if 1    // align data by 8 bytes
-#define alloc_meta_sizeof ((sizeof(void *) * 2 + sizeof(uint32_t) + sizeof(char)) / 8 + 1) * 8
-#else
-#define alloc_meta_sizeof (sizeof(void *) * 2 + sizeof(uint32_t) + sizeof(char))
-#endif
+void *alloc_slab_last_4b = NULL;
+void *alloc_slab_last_8b = NULL;
+void *alloc_slab_last_16b = NULL;
+void *alloc_slab_last_32b = NULL;
+void *alloc_slab_last_64b = NULL;
+void *alloc_slab_last_128b = NULL;
+void *alloc_slab_last_256b = NULL;
+
+#define alloc_meta_sizeof    (size_t)alloc_meta_data(0)
 #define alloc_meta_prev(ptr) (void **)(ptr)
 #define alloc_meta_next(ptr) (void **)((ptr) + sizeof(void *))
 #define alloc_meta_size(ptr) (uint32_t *)((ptr) + sizeof(void *) * 2)
-#define alloc_meta_tag(ptr)  (char *)((ptr) + sizeof(void *) * 2 + sizeof(uint32_t))
-#define alloc_meta_data(ptr) (void *)((ptr) + alloc_meta_sizeof)
+#define alloc_meta_tag(ptr)  (AllocationType *)((ptr) + sizeof(void *) * 2 + sizeof(uint32_t))
+#define alloc_meta_data(ptr) (void *)((ptr) + sizeof(void *) * 2 + sizeof(uint32_t) + sizeof(AllocationType))
+#define alloc_slab_item_sizeof    (size_t)(2)
 
-enum {
-	ALLOCATION_INVALID = 0,
-	ALLOCATION_UNUSED = 1,
-	ALLOCATION_USED = 2,
+#define unreachable() __builtin_trap()
+
+#define sized_enum(typ, name)                                                                                          \
+	typedef typ name;                                                                                                  \
+	enum
+
+// changing this to any other size WILL misalign all allocation
+sized_enum(uint32_t, AllocationType) {
+	ALLOCATION_SLAB_ITEM = (1 << 0),
+	ALLOCATION_USED = (1 << 1),
+};
+
+sized_enum(char, SlabSize) {
+	SLAB_4B = 0, SLAB_8B = 1, SLAB_16B = 2, SLAB_32B = 3, SLAB_64B = 4, SLAB_128B = 5, SLAB_256B = 6,
 };
 
 #define dump_ptr(ptr) (ptr ? (void *)((ptr) - alloc_base + ALLOCATOR_SIZE) : NULL)
@@ -38,21 +57,9 @@ allocation_dump(void *ptr)
 {
 	void *prev = *alloc_meta_prev(ptr);
 	void *next = *alloc_meta_next(ptr);
-	const char *tag;
-	switch (*alloc_meta_tag(ptr)) {
-	case ALLOCATION_UNUSED:
-		tag = "<unused>";
-		break;
-	case ALLOCATION_USED:
-		tag = "<used>";
-		break;
-	default:
-	case ALLOCATION_INVALID:
-		tag = "<invalid>";
-		break;
-	}
+	const char *tag_str = (*alloc_meta_tag(ptr) & ALLOCATION_USED) ? "<used>" : "<unused>";
 	printf("%p: Allocation{prev: %p, next: %p, size: %d, tag: %s}\n", dump_ptr(ptr), dump_ptr(prev), dump_ptr(next),
-	       *alloc_meta_size(ptr), tag);
+	       *alloc_meta_size(ptr), tag_str);
 }
 
 void
@@ -69,19 +76,52 @@ memory_dump()
 
 #undef dump_ptr
 
+void *alloc_reserve(size_t size);
+
+void *alloc_slab_segment(SlabSize size) {
+	assert((size >= SLAB_4B && size <= SLAB_256B) && "Not a real SlabSize");
+
+	// to make the size of allocation itself a power of two
+	void *ptr = alloc_reserve(((4 << size) << 12) - alloc_meta_sizeof);
+	if (ptr == NULL) return NULL;
+	
+	*alloc_meta_tag(ptr) = ALLOCATION_USED;
+
+	if (ptr == alloc_last_free) {
+		fprintf(stderr, "[ERROR]: reserved memory still recognized as last freed\n");
+		allocation_dump(ptr);
+		__builtin_trap();
+	}
+
+	// ((4 << size) << 12) - size of allocation in bytes
+	// ($ - 512 - alloc_meta_sizeof - alloc_slab_item_sizeof) - how much memory left in bytes for items
+	// ($ / (4 << size)) - hom many item slots left
+	// ((1 << 12) - $) - how many item slots used by metadata and bitmap
+	int occupied_items = (1 << 12) - (((4 << size) << 12) - 512 - alloc_meta_sizeof - alloc_slab_item_sizeof) / (4 << size);
+	
+	char *bitmap = memset(alloc_meta_data(ptr), 0xff, 512);
+	memset(bitmap, 0, occupied_items / 8);
+	bitmap[occupied_items / 8] = 0xff >> (occupied_items % 8);
+
+	return ptr;
+}
+
 void
 alloc_init(void)
 {
 	alloc_base = malloc(ALLOCATOR_SIZE);    // 32MB
 	alloc_cursor = alloc_base;
 	alloc_end = alloc_base + ALLOCATOR_SIZE;
-	printf("base: %p; end: %p; header_size: %d\n", alloc_base, alloc_end, (int)alloc_meta_sizeof);
-}
 
-char
-allocation_check_next(void *ptr)
-{
-	return *alloc_meta_tag(ptr + *alloc_meta_size(ptr) + alloc_meta_sizeof);
+	alloc_slab_last_256b = alloc_slab_segment(SLAB_256B);
+	alloc_slab_last_128b = alloc_slab_segment(SLAB_128B);
+	alloc_slab_last_64b = alloc_slab_segment(SLAB_64B);
+	alloc_slab_last_32b = alloc_slab_segment(SLAB_32B);
+	alloc_slab_last_16b = alloc_slab_segment(SLAB_16B);
+	alloc_slab_last_8b = alloc_slab_segment(SLAB_8B);
+	alloc_slab_last_4b = alloc_slab_segment(SLAB_4B);
+
+	printf("base: %p; end: %p; header_size: %d\n", alloc_base, alloc_end, (int)alloc_meta_sizeof);
 }
 
 void
@@ -143,7 +183,7 @@ alloc_reserve(size_t size)
 		// add merging code here, this may introduce overhead
 		if (cur_size < size) {
 			void *next = cursor + alloc_meta_sizeof + cur_size;
-			while (*alloc_meta_tag(next) == ALLOCATION_UNUSED) {
+			while (!(*alloc_meta_tag(next) & ALLOCATION_USED)) {
 				if (best_count) {
 					int remove_at = -1;
 					for (int i = 0; i < best_count; i++) {
@@ -200,7 +240,7 @@ alloc_reserve(size_t size)
 		void *next = alloc_meta_data(cursor) + size;
 		*alloc_meta_size(cursor) = size;
 		*alloc_meta_size(next) = cur_size - alloc_meta_sizeof - size;
-		*alloc_meta_tag(next) = ALLOCATION_UNUSED;
+		*alloc_meta_tag(next) = 0;
 		allocation_replace(cursor, next);
 		return cursor;
 #endif
@@ -241,7 +281,12 @@ fre(void *ptr)
 	void *next, *prev;
 
 	ptr -= alloc_meta_sizeof;
-	*alloc_meta_tag(ptr) = ALLOCATION_UNUSED;
+	// you could also just do = 0; but this is more informative (and more error prone because of retained tags in other
+	// bits)
+	if (*alloc_meta_tag(ptr) & ALLOCATION_USED)
+		*alloc_meta_tag(ptr) ^= ALLOCATION_USED;
+	else
+		fprintf(stderr, "Freeing already freed allocation");
 
 	// unlink from allocated
 	if (ptr == alloc_last_allocation)
@@ -257,7 +302,7 @@ fre(void *ptr)
 	// merge unused memory (forward step)
 	size_t new_size = *alloc_meta_size(ptr);
 	next = ptr + alloc_meta_sizeof + new_size;
-	while (*alloc_meta_tag(next) == ALLOCATION_UNUSED) {
+	while (!(*alloc_meta_tag(next) & ALLOCATION_USED)) {
 		new_size += *alloc_meta_size(next) + alloc_meta_sizeof;
 		allocation_unlink(next);
 		next = ptr + alloc_meta_sizeof + new_size;
