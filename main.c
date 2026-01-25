@@ -183,7 +183,7 @@ alloc_slab_get_item(SlabSize size)
 	uint16_t *item_meta = alloc_slab_item_meta(item);
 
 	// printf("allocated slab item\n");
-	printf("\\ ptr: %p, meta: %p, %d\n", item, item_meta, (*item_meta) >> 4);
+	printf("SI alloc\\ ptr: %p, meta: %p, %d\n", item, item_meta, (*item_meta) >> 4);
 	// printf("%0*b\n", 16, *alloc_slab_item_meta(item));
 	return item;
 }
@@ -352,25 +352,10 @@ alloc(size_t size)
 		//        (int)size, (int)(4 << fit), (int)sizeof(int) * 8, __builtin_clz((int)size));
 		assert((fit >= SLAB_4B && fit <= SLAB_256B) && "Not a real SlabSize");
 		return alloc_slab_get_item(fit);
-		// switch (fit) {
-		// case SLAB_4B:
-		// 	return alloc_slab_get_item(&alloc_slab_last_4b);
-		// case SLAB_8B:
-		// 	return alloc_slab_get_item(&alloc_slab_last_8b);
-		// case SLAB_16B:
-		// 	return alloc_slab_get_item(&alloc_slab_last_16b);
-		// case SLAB_32B:
-		// 	return alloc_slab_get_item(&alloc_slab_last_32b);
-		// case SLAB_64B:
-		// 	return alloc_slab_get_item(&alloc_slab_last_64b);
-		// case SLAB_128B:
-		// 	return alloc_slab_get_item(&alloc_slab_last_128b);
-		// case SLAB_256B:
-		// 	return alloc_slab_get_item(&alloc_slab_last_256b);
-		// default:
-		// 	unreachable();
-		// }
 	}
+
+	 // align allocations on doubly linked lists to 512 bytes
+	 size = ((size + alloc_meta_sizeof) / 512 + 1) * 512 - alloc_meta_sizeof;
 
 	allocation = alloc_reserve(size);    // alloc_cursor;
 	if (allocation == NULL)
